@@ -1,0 +1,6 @@
+{
+  "corpus_source": "neo4j",
+  "doc_count": 20462,
+  "embedding_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "fingerprint": "814a717fd3fa8f0989a6d0ff8a0f4ef39bc432ca84542c5177fe0bcf3ff6a260"
+}
