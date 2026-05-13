@@ -45,6 +45,44 @@ def _save_json(path: Path, data: dict[str, Any]) -> None:
         logger.warning('Could not write FAISS corpus metadata %s: %s', path, exc)
 
 
+def _cuda_device_id(device: str | None) -> int:
+    if not device:
+        return 0
+    parts = str(device).split(':', maxsplit=1)
+    if len(parts) == 2 and parts[0].lower() == 'cuda':
+        try:
+            return int(parts[1])
+        except ValueError:
+            return 0
+    return 0
+
+
+def _maybe_move_faiss_to_gpu(vectorstore: Any, settings: Settings) -> Any:
+    if not settings.use_faiss_gpu:
+        return vectorstore
+
+    device = settings.embedding_device
+    if not str(device).lower().startswith('cuda'):
+        logger.warning('USE_FAISS_GPU=true but EMBEDDING_DEVICE=%s is not CUDA; keeping FAISS on CPU.', device)
+        return vectorstore
+
+    try:
+        import faiss
+
+        if not hasattr(faiss, 'StandardGpuResources'):
+            logger.warning('USE_FAISS_GPU=true but installed FAISS has no GPU support; install faiss-gpu to enable it.')
+            return vectorstore
+
+        resources = faiss.StandardGpuResources()
+        device_id = _cuda_device_id(device)
+        vectorstore.index = faiss.index_cpu_to_gpu(resources, device_id, vectorstore.index)
+        vectorstore._faiss_gpu_resources = resources
+        logger.info('Moved FAISS index to GPU device %s.', device_id)
+    except Exception as exc:
+        logger.warning('Could not move FAISS index to GPU; keeping CPU FAISS: %s', exc)
+    return vectorstore
+
+
 class KeywordRetriever:
     """No-dependency fallback retriever used in smoke tests."""
 
@@ -148,6 +186,8 @@ class RAGRetriever:
             vectorstore.save_local(str(vectorstore_path))
             _save_json(meta_path, desired_meta)
 
+        vectorstore = _maybe_move_faiss_to_gpu(vectorstore, settings)
+
         bm25_retriever = BM25Retriever.from_documents(docs)
         bm25_retriever.k = settings.bm25_k
         faiss_retriever = vectorstore.as_retriever(search_kwargs={'k': settings.faiss_k})
@@ -157,7 +197,11 @@ class RAGRetriever:
         )
 
         if settings.use_cross_encoder:
-            cross_encoder = HuggingFaceCrossEncoder(model_name=settings.cross_encoder_model)
+            cross_encoder_device = settings.cross_encoder_device or settings.embedding_device
+            cross_encoder = HuggingFaceCrossEncoder(
+                model_name=settings.cross_encoder_model,
+                model_kwargs={'device': cross_encoder_device},
+            )
             reranker = CrossEncoderReranker(model=cross_encoder, top_n=settings.rerank_top_n)
             retriever = ContextualCompressionRetriever(
                 base_compressor=reranker,

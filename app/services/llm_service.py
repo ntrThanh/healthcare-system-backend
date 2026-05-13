@@ -9,6 +9,17 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _setup_torch_inference_runtime(torch):
+    """Enable safe CUDA inference optimizations without changing public APIs."""
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+
 def get_setting(*names: str, default: Any = None) -> Any:
     for name in names:
         if hasattr(settings, name):
@@ -22,7 +33,8 @@ class LLMService:
     """HuggingFace causal LM service. Runtime parameters come from DB."""
 
     def __init__(self):
-        self._pipeline = None
+        self._loaded = False
+        self._use_mock = False
         self._tokenizer = None
         self._model = None
         self._active_config_id: str | None = None
@@ -72,19 +84,22 @@ class LLMService:
                 load_in_4bit = bool(get_setting("MODEL_LOAD_IN_4BIT", "model_load_in_4bit", default=False))
                 trust_remote_code = True
 
-            if self._pipeline and not force_reload and self._active_model_name == model_name:
+            if self.is_loaded and not force_reload and self._active_model_name == model_name:
                 logger.info("LLM already loaded with active DB config; skip reload.")
                 return
 
             if use_mock_llm:
                 logger.warning("USE_MOCK_LLM=true: using mock LLMService.")
-                self._pipeline = "mock"
+                self._use_mock = True
+                self._loaded = True
                 self._active_model_name = model_name
                 self._mark_loaded(True)
                 return
 
-            from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+            from transformers import AutoTokenizer, AutoModelForCausalLM
             import torch
+
+            _setup_torch_inference_runtime(torch)
 
             if torch_dtype_name == "bfloat16":
                 torch_dtype = torch.bfloat16
@@ -100,11 +115,20 @@ class LLMService:
                 use_fast=True,
                 trust_remote_code=trust_remote_code,
             )
+            if self._tokenizer.pad_token is None:
+                self._tokenizer.pad_token = self._tokenizer.eos_token
+
+            attn_implementation = str(get_setting(
+                "MODEL_ATTENTION_IMPL",
+                "model_attention_impl",
+                default="sdpa",
+            ) or "sdpa")
 
             model_kwargs = {
                 "torch_dtype": torch_dtype,
-                "device_map": "auto",
+                "device_map": {"": 0} if torch.cuda.is_available() else "auto",
                 "trust_remote_code": trust_remote_code,
+                "attn_implementation": attn_implementation,
             }
 
             if load_in_4bit:
@@ -119,25 +143,36 @@ class LLMService:
                     bnb_4bit_use_double_quant=True,
                 )
 
-            self._model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                **model_kwargs,
-            )
+            try:
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    **model_kwargs,
+                )
+            except Exception as e:
+                if "attn_implementation" in str(e) or "Attention" in str(e):
+                    logger.warning("Attention backend %s failed; retrying with default backend: %s", attn_implementation, e)
+                    model_kwargs.pop("attn_implementation", None)
+                    self._model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        **model_kwargs,
+                    )
+                else:
+                    raise
 
-            self._pipeline = pipeline(
-                "text-generation",
-                model=self._model,
-                tokenizer=self._tokenizer,
-                max_new_tokens=self._max_new_tokens,
-                temperature=self._temperature,
-                do_sample=self._do_sample,
-                repetition_penalty=self._repetition_penalty,
-                return_full_text=False,
-            )
+            self._model.eval()
+            if getattr(self._model, "generation_config", None) is not None:
+                self._model.generation_config.use_cache = True
+                self._model.generation_config.pad_token_id = self._tokenizer.pad_token_id
+                self._model.generation_config.eos_token_id = self._tokenizer.eos_token_id
+
+            self._use_mock = False
+            self._loaded = True
             self._active_model_name = model_name
             self._mark_loaded(True)
             logger.info("LLM loaded successfully from DB config.")
         except Exception:
+            self._loaded = False
+            self._use_mock = False
             self._mark_loaded(False)
             logger.exception("Failed to load LLM")
             raise
@@ -162,7 +197,7 @@ class LLMService:
 
     @property
     def is_loaded(self) -> bool:
-        return self._pipeline is not None
+        return self._loaded and (self._use_mock or (self._model is not None and self._tokenizer is not None))
 
     @property
     def tokenizer(self):
@@ -173,24 +208,48 @@ class LLMService:
         self.load(force_reload=True)
 
     def unload(self):
-        self._pipeline = None
+        self._loaded = False
+        self._use_mock = False
         self._tokenizer = None
         self._model = None
         self._mark_loaded(False)
 
     def generate(self, prompt: str) -> tuple[str, float]:
-        if not self._pipeline:
+        if not self.is_loaded:
             logger.warning("LLM not loaded. Loading from active DB config now...")
             self.load()
 
         t0 = time.perf_counter()
-        if self._pipeline == "mock":
+        if self._use_mock:
             latency_ms = (time.perf_counter() - t0) * 1000
             return "Mocked LLM answer.", round(latency_ms, 1)
 
-        result = self._pipeline(prompt)
+        import torch
+
+        inputs = self._tokenizer(prompt, return_tensors="pt")
+        if torch.cuda.is_available():
+            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+
+        input_len = inputs["input_ids"].shape[-1]
+        generation_kwargs = {
+            **inputs,
+            "max_new_tokens": self._max_new_tokens,
+            "do_sample": self._do_sample,
+            "repetition_penalty": self._repetition_penalty,
+            "use_cache": True,
+            "pad_token_id": self._tokenizer.pad_token_id,
+            "eos_token_id": self._tokenizer.eos_token_id,
+        }
+        if self._do_sample:
+            generation_kwargs["temperature"] = self._temperature
+
+        with torch.inference_mode():
+            output_ids = self._model.generate(**generation_kwargs)
+
+        new_tokens = output_ids[0, input_len:]
+        answer = self._tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         latency_ms = (time.perf_counter() - t0) * 1000
-        return result[0]["generated_text"].strip(), round(latency_ms, 1)
+        return answer, round(latency_ms, 1)
 
     def invoke(self, prompt: str):
         """LangChain-like interface used by SafeVoiceMedicalChatbot.
@@ -207,11 +266,11 @@ class LLMService:
         return self._active_model_name
 
     def stream(self, prompt: str, should_stop: Callable[[], bool] | None = None) -> Generator[str, None, None]:
-        if not self._pipeline:
+        if not self.is_loaded:
             logger.warning("LLM not loaded. Loading from active DB config now...")
             self.load()
 
-        if self._pipeline == "mock":
+        if self._use_mock:
             for token in "Mocked LLM answer.".split():
                 if should_stop and should_stop():
                     break
@@ -235,12 +294,21 @@ class LLMService:
             **inputs,
             streamer=streamer,
             max_new_tokens=self._max_new_tokens,
-            temperature=self._temperature,
             do_sample=self._do_sample,
             repetition_penalty=self._repetition_penalty,
+            use_cache=True,
+            pad_token_id=self._tokenizer.pad_token_id,
+            eos_token_id=self._tokenizer.eos_token_id,
             stopping_criteria=StoppingCriteriaList([StopOnCancel()]),
         )
-        thread = threading.Thread(target=self._model.generate, kwargs=generation_kwargs)
+        if self._do_sample:
+            generation_kwargs["temperature"] = self._temperature
+
+        def _generate_inference():
+            with torch.inference_mode():
+                self._model.generate(**generation_kwargs)
+
+        thread = threading.Thread(target=_generate_inference)
         thread.start()
 
         for token in streamer:

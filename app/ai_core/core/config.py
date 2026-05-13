@@ -65,6 +65,8 @@ class Settings(BaseSettings):
         alias="EMBEDDING_MODEL",
     )
     embedding_device: str = Field("cpu", alias="EMBEDDING_DEVICE")
+    cross_encoder_device: str | None = Field(None, alias="CROSS_ENCODER_DEVICE")
+    use_faiss_gpu: bool = Field(False, alias="USE_FAISS_GPU")
     vectorstore_path: Path = Field(
         PROJECT_ROOT / "artifacts/vectorstore/medical_faiss_v4",
         alias="VECTORSTORE_PATH",
