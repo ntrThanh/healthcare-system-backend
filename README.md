@@ -86,6 +86,12 @@ Dạng `multipart/form-data`. Upload file audio qua trường `file`.
 POST /api/tts?text=Câu+muốn+nói
 ```
 
+```
+wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+chmod +x cloudflared
+./cloudflared tunnel --url http://127.0.0.1:8000
+```
+
 ---
 
 ## Chạy Server & Test (Swagger UI)
