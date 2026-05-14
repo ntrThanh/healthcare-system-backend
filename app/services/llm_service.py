@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from contextlib import contextmanager
 from typing import Callable, Generator, Any
 
 from app.core.config import settings
@@ -43,6 +45,8 @@ class LLMService:
         self._temperature = 0.3
         self._repetition_penalty = 1.1
         self._do_sample = True
+        self._generation_semaphore: threading.BoundedSemaphore | None = None
+        self._max_concurrent_requests = 1
 
     def _get_active_config(self):
         """Read active model config from DB. DB should already be initialized."""
@@ -92,6 +96,7 @@ class LLMService:
                 logger.warning("USE_MOCK_LLM=true: using mock LLMService.")
                 self._use_mock = True
                 self._loaded = True
+                self._configure_generation_limit()
                 self._active_model_name = model_name
                 self._mark_loaded(True)
                 return
@@ -167,6 +172,7 @@ class LLMService:
 
             self._use_mock = False
             self._loaded = True
+            self._configure_generation_limit(torch)
             self._active_model_name = model_name
             self._mark_loaded(True)
             logger.info("LLM loaded successfully from DB config.")
@@ -176,6 +182,61 @@ class LLMService:
             self._mark_loaded(False)
             logger.exception("Failed to load LLM")
             raise
+
+    def _configure_generation_limit(self, torch=None):
+        max_requests = self._resolve_max_concurrent_requests(torch)
+        self._max_concurrent_requests = max_requests
+        self._generation_semaphore = threading.BoundedSemaphore(max_requests)
+        logger.info("LLM generation concurrency limit: %s", max_requests)
+
+    def _resolve_max_concurrent_requests(self, torch=None) -> int:
+        configured = str(get_setting("LLM_MAX_CONCURRENT_REQUESTS", default="auto")).strip().lower()
+        if configured != "auto":
+            try:
+                return max(1, int(configured))
+            except ValueError:
+                logger.warning("Invalid LLM_MAX_CONCURRENT_REQUESTS=%s; using 1.", configured)
+                return 1
+
+        if self._use_mock:
+            return int(get_setting("LLM_CONCURRENCY_MAX_AUTO", default=4) or 4)
+
+        if torch is None:
+            try:
+                import torch as torch_module
+                torch = torch_module
+            except Exception:
+                return 1
+
+        if not torch.cuda.is_available():
+            return 1
+
+        try:
+            device = self._model.device if self._model is not None else torch.device("cuda:0")
+            device_index = device.index if getattr(device, "index", None) is not None else 0
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+            reserved_gb = float(get_setting("LLM_CONCURRENCY_RESERVED_VRAM_GB", default=4.0) or 4.0)
+            per_request_gb = float(get_setting("LLM_CONCURRENCY_ESTIMATED_REQUEST_VRAM_GB", default=4.0) or 4.0)
+            max_auto = int(get_setting("LLM_CONCURRENCY_MAX_AUTO", default=4) or 4)
+
+            free_gb = free_bytes / (1024 ** 3)
+            usable_gb = max(0.0, free_gb - reserved_gb)
+            calculated = int(usable_gb // max(per_request_gb, 0.1))
+            return max(1, min(max_auto, calculated))
+        except Exception as e:
+            logger.warning("Could not auto-detect LLM concurrency; using 1: %s", e)
+            return 1
+
+    @contextmanager
+    def _generation_slot(self):
+        if self._generation_semaphore is None:
+            self._configure_generation_limit()
+        assert self._generation_semaphore is not None
+        self._generation_semaphore.acquire()
+        try:
+            yield
+        finally:
+            self._generation_semaphore.release()
 
     def _mark_loaded(self, loaded: bool):
         if not self._active_config_id:
@@ -226,25 +287,26 @@ class LLMService:
 
         import torch
 
-        inputs = self._tokenizer(prompt, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        with self._generation_slot():
+            inputs = self._tokenizer(prompt, return_tensors="pt")
+            if torch.cuda.is_available():
+                inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
 
-        input_len = inputs["input_ids"].shape[-1]
-        generation_kwargs = {
-            **inputs,
-            "max_new_tokens": self._max_new_tokens,
-            "do_sample": self._do_sample,
-            "repetition_penalty": self._repetition_penalty,
-            "use_cache": True,
-            "pad_token_id": self._tokenizer.pad_token_id,
-            "eos_token_id": self._tokenizer.eos_token_id,
-        }
-        if self._do_sample:
-            generation_kwargs["temperature"] = self._temperature
+            input_len = inputs["input_ids"].shape[-1]
+            generation_kwargs = {
+                **inputs,
+                "max_new_tokens": self._max_new_tokens,
+                "do_sample": self._do_sample,
+                "repetition_penalty": self._repetition_penalty,
+                "use_cache": True,
+                "pad_token_id": self._tokenizer.pad_token_id,
+                "eos_token_id": self._tokenizer.eos_token_id,
+            }
+            if self._do_sample:
+                generation_kwargs["temperature"] = self._temperature
 
-        with torch.inference_mode():
-            output_ids = self._model.generate(**generation_kwargs)
+            with torch.inference_mode():
+                output_ids = self._model.generate(**generation_kwargs)
 
         new_tokens = output_ids[0, input_len:]
         answer = self._tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
@@ -278,45 +340,45 @@ class LLMService:
             return
 
         from transformers import TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList
-        import threading
         import torch
 
         class StopOnCancel(StoppingCriteria):
             def __call__(self, input_ids, scores, **kwargs):
                 return bool(should_stop and should_stop())
 
-        streamer = TextIteratorStreamer(self._tokenizer, skip_special_tokens=True, skip_prompt=True)
-        inputs = self._tokenizer(prompt, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        with self._generation_slot():
+            streamer = TextIteratorStreamer(self._tokenizer, skip_special_tokens=True, skip_prompt=True)
+            inputs = self._tokenizer(prompt, return_tensors="pt")
+            if torch.cuda.is_available():
+                inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
 
-        generation_kwargs = dict(
-            **inputs,
-            streamer=streamer,
-            max_new_tokens=self._max_new_tokens,
-            do_sample=self._do_sample,
-            repetition_penalty=self._repetition_penalty,
-            use_cache=True,
-            pad_token_id=self._tokenizer.pad_token_id,
-            eos_token_id=self._tokenizer.eos_token_id,
-            stopping_criteria=StoppingCriteriaList([StopOnCancel()]),
-        )
-        if self._do_sample:
-            generation_kwargs["temperature"] = self._temperature
+            generation_kwargs = dict(
+                **inputs,
+                streamer=streamer,
+                max_new_tokens=self._max_new_tokens,
+                do_sample=self._do_sample,
+                repetition_penalty=self._repetition_penalty,
+                use_cache=True,
+                pad_token_id=self._tokenizer.pad_token_id,
+                eos_token_id=self._tokenizer.eos_token_id,
+                stopping_criteria=StoppingCriteriaList([StopOnCancel()]),
+            )
+            if self._do_sample:
+                generation_kwargs["temperature"] = self._temperature
 
-        def _generate_inference():
-            with torch.inference_mode():
-                self._model.generate(**generation_kwargs)
+            def _generate_inference():
+                with torch.inference_mode():
+                    self._model.generate(**generation_kwargs)
 
-        thread = threading.Thread(target=_generate_inference)
-        thread.start()
+            thread = threading.Thread(target=_generate_inference)
+            thread.start()
 
-        for token in streamer:
-            if should_stop and should_stop():
-                break
-            yield token
+            for token in streamer:
+                if should_stop and should_stop():
+                    break
+                yield token
 
-        thread.join(timeout=1)
+            thread.join(timeout=1)
 
 
 llm_service = LLMService()

@@ -12,6 +12,7 @@ certifi==2026.4.22
 cffi==2.0.0
 charset-normalizer==3.4.7
 click==8.1.8
+cryptography>=42,<47
 ctranslate2==4.7.1
 dataclasses-json==0.6.7
 edge-tts==7.2.8
@@ -74,6 +75,7 @@ pydantic==2.13.4
 pydantic-settings==2.14.1
 pydantic_core==2.46.4
 Pygments==2.20.0
+PyMySQL>=1.1,<2
 pytest==8.4.2
 python-dotenv==1.2.2
 python-multipart==0.0.27

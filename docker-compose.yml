@@ -1,0 +1,58 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: healthcare-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: healthcare_db
+      MYSQL_USER: healthcare_user
+      MYSQL_PASSWORD: healthcare_password
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uhealthcare_user -phealthcare_password --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: healthcare-api
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - ${ENV_FILE:-.env.docker.example}
+    environment:
+      DATABASE_URL: mysql+pymysql://healthcare_user:healthcare_password@mysql:3306/healthcare_db?charset=utf8mb4
+      HOST: 0.0.0.0
+      PORT: 8000
+      WAIT_FOR_HOST: mysql
+      WAIT_FOR_PORT: 3306
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    ports:
+      - "8000:8000"
+    gpus: all
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - ./artifacts:/app/artifacts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  mysql_data:
+  hf_cache:

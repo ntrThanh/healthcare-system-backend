@@ -1,13 +1,58 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker, Session as DBSession
 from app.core.config import settings
 from app.db.models import Base
 
-engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args={"check_same_thread": False},  # required for SQLite + FastAPI
-    pool_pre_ping=True,
-)
+
+def _quote_mysql_identifier(identifier: str) -> str:
+    return f"`{identifier.replace('`', '``')}`"
+
+
+def _ensure_database_exists(database_url: str) -> None:
+    url = make_url(database_url)
+    if not url.drivername.startswith("mysql") or not url.database:
+        return
+
+    database_name = url.database
+    server_url = url.set(database=None)
+    server_engine = create_engine(
+        server_url,
+        connect_args={"charset": "utf8mb4"},
+        pool_pre_ping=True,
+        pool_recycle=3600,
+    )
+    try:
+        with server_engine.begin() as conn:
+            conn.execute(text(
+                "CREATE DATABASE IF NOT EXISTS "
+                f"{_quote_mysql_identifier(database_name)} "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            ))
+    finally:
+        server_engine.dispose()
+
+
+def _engine_options(database_url: str) -> dict:
+    if database_url.startswith("sqlite"):
+        return {
+            "connect_args": {"check_same_thread": False},
+            "pool_pre_ping": True,
+        }
+    if database_url.startswith("mysql"):
+        return {
+            "connect_args": {"charset": "utf8mb4"},
+            "pool_pre_ping": True,
+            "pool_recycle": 3600,
+        }
+    return {
+        "pool_pre_ping": True,
+        "pool_recycle": 3600,
+    }
+
+
+_ensure_database_exists(settings.DATABASE_URL)
+engine = create_engine(settings.DATABASE_URL, **_engine_options(settings.DATABASE_URL))
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

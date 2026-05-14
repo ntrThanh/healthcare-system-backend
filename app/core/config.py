@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_MINUTE: int = 60
 
     # ── Database ─────────────────────────────────────────────────────────
-    DATABASE_URL: str = "sqlite:///./ai_server.db"
+    DATABASE_URL: str = "mysql+pymysql://healthcare_user:healthcare_password@localhost:3306/healthcare_db?charset=utf8mb4"
 
     # ── Runtime switches ─────────────────────────────────────────────────
     USE_MOCK_LLM: bool = False
@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.7
     LLM_DO_SAMPLE: bool = True
     LLM_DEVICE: str = "cpu"
+    LLM_MAX_CONCURRENT_REQUESTS: str = "auto"
+    LLM_CONCURRENCY_RESERVED_VRAM_GB: float = 4.0
+    LLM_CONCURRENCY_ESTIMATED_REQUEST_VRAM_GB: float = 4.0
+    LLM_CONCURRENCY_MAX_AUTO: int = 4
 
     # HuggingFace model params used to seed DB on first startup.
     MODEL_NAME: str = "Qwen/Qwen2.5-7B-Instruct"
