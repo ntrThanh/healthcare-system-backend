@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session as DBSession
 
 from app.ai_core.serving.dependencies import get_chatbot
-from app.db.models import Message
+from app.db.models import Message, Session as ChatSession
 from app.services.cancellation import cancellation_manager, is_cancel_message
 from app.services.llm_service import llm_service
 from app.services.session_manager import session_manager
@@ -44,27 +44,29 @@ class ChatService:
     ) -> dict[str, Any]:
         user = session_manager.get_or_create_user(user_id, db)
         session = session_manager.get_or_create_session(user, session_id, context, db)
+        chat_session_id = session.id
 
         input_warnings = warning_service.detect(db, message)
 
         if is_cancel_message(message):
-            cancelled = await cancellation_manager.cancel(user_id, session.id)
+            cancelled = await cancellation_manager.cancel(user_id, chat_session_id)
             return self._empty_response(
-                session_id=session.id,
+                session_id=chat_session_id,
                 answer="Đã dừng câu trả lời đang chạy." if cancelled else "Không có câu trả lời nào đang chạy để dừng.",
-                token_remaining=token_service.usage(db, session.id)["remaining_tokens"],
+                token_remaining=token_service.usage(db, chat_session_id)["remaining_tokens"],
                 warnings=input_warnings,
             )
 
-        cancel_event = await cancellation_manager.start(user_id, session.id)
+        cancel_event = await cancellation_manager.start(user_id, chat_session_id)
         try:
             t0 = time.perf_counter()
-            history_text = self._build_db_history(session.id, db)
+            history_text = self._build_db_history(chat_session_id, db)
             extra_context = self._build_extra_context(session.context)
+            db.rollback()
 
             result = await self._run_safevoice_pipeline(
                 message=message,
-                session_id=session.id,
+                session_id=chat_session_id,
                 history_text=history_text,
                 extra_context=extra_context,
                 cancel_event=cancel_event,
@@ -72,9 +74,9 @@ class ChatService:
 
             if cancel_event.is_set():
                 return self._empty_response(
-                    session_id=session.id,
+                    session_id=chat_session_id,
                     answer="Đã dừng câu trả lời đang chạy.",
-                    token_remaining=token_service.usage(db, session.id)["remaining_tokens"],
+                    token_remaining=token_service.usage(db, chat_session_id)["remaining_tokens"],
                     warnings=input_warnings,
                     result=result,
                 )
@@ -94,6 +96,10 @@ class ChatService:
             )
             completion_tokens = token_service.estimate_tokens(answer, llm_service.tokenizer)
 
+            session = db.query(ChatSession).filter_by(id=chat_session_id).first()
+            if not session:
+                raise RuntimeError(f"Chat session {chat_session_id} disappeared before saving response.")
+
             _, assistant_msg = session_manager.save_turn(
                 session=session,
                 user_content=message,
@@ -102,13 +108,13 @@ class ChatService:
                 latency_ms=latency_ms,
                 db=db,
             )
-            token_service.charge_tokens(db, session.id, prompt_tokens, completion_tokens)
-            usage = token_service.usage(db, session.id)
+            token_service.charge_tokens(db, chat_session_id, prompt_tokens, completion_tokens)
+            usage = token_service.usage(db, chat_session_id)
 
-            await summarizer_service.maybe_summarize(session.id, db)
+            await summarizer_service.maybe_summarize(chat_session_id)
 
             return {
-                "session_id": session.id,
+                "session_id": chat_session_id,
                 "message_id": assistant_msg.id,
                 "answer": answer,
                 "rag_sources": sources or None,
@@ -125,7 +131,7 @@ class ChatService:
                 "audio_url": result.get("audio_url") or result.get("audio_path"),
             }
         finally:
-            await cancellation_manager.finish(user_id, session.id, cancel_event)
+            await cancellation_manager.finish(user_id, chat_session_id, cancel_event)
 
     async def chat_stream(
         self,

@@ -61,6 +61,13 @@ class Settings(BaseSettings):
 
     # ── Database ─────────────────────────────────────────────────────────
     DATABASE_URL: str = "mysql+pymysql://healthcare_user:healthcare_password@localhost:3306/healthcare_db?charset=utf8mb4"
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_TIMEOUT: int = 30
+    DB_POOL_RECYCLE: int = 1800
+    DB_CONNECT_TIMEOUT: int = 10
+    DB_READ_TIMEOUT: int = 60
+    DB_WRITE_TIMEOUT: int = 60
 
     # ── Runtime switches ─────────────────────────────────────────────────
     USE_MOCK_LLM: bool = False

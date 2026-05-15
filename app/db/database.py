@@ -1,8 +1,19 @@
+import logging
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker, Session as DBSession
 from app.core.config import settings
 from app.db.models import Base
+
+
+logger = logging.getLogger(__name__)
+
+
+def _is_mysql_command_out_of_sync(exc: OperationalError) -> bool:
+    orig_args = getattr(exc.orig, "args", ())
+    return bool(orig_args and orig_args[0] == 2014)
 
 
 def _quote_mysql_identifier(identifier: str) -> str:
@@ -18,9 +29,14 @@ def _ensure_database_exists(database_url: str) -> None:
     server_url = url.set(database=None)
     server_engine = create_engine(
         server_url,
-        connect_args={"charset": "utf8mb4"},
+        connect_args={
+            "charset": "utf8mb4",
+            "connect_timeout": settings.DB_CONNECT_TIMEOUT,
+            "read_timeout": settings.DB_READ_TIMEOUT,
+            "write_timeout": settings.DB_WRITE_TIMEOUT,
+        },
         pool_pre_ping=True,
-        pool_recycle=3600,
+        pool_recycle=settings.DB_POOL_RECYCLE,
     )
     try:
         with server_engine.begin() as conn:
@@ -41,9 +57,18 @@ def _engine_options(database_url: str) -> dict:
         }
     if database_url.startswith("mysql"):
         return {
-            "connect_args": {"charset": "utf8mb4"},
+            "connect_args": {
+                "charset": "utf8mb4",
+                "connect_timeout": settings.DB_CONNECT_TIMEOUT,
+                "read_timeout": settings.DB_READ_TIMEOUT,
+                "write_timeout": settings.DB_WRITE_TIMEOUT,
+            },
             "pool_pre_ping": True,
-            "pool_recycle": 3600,
+            "pool_recycle": settings.DB_POOL_RECYCLE,
+            "pool_size": settings.DB_POOL_SIZE,
+            "max_overflow": settings.DB_MAX_OVERFLOW,
+            "pool_timeout": settings.DB_POOL_TIMEOUT,
+            "pool_reset_on_return": "rollback",
         }
     return {
         "pool_pre_ping": True,
@@ -54,7 +79,12 @@ def _engine_options(database_url: str) -> dict:
 _ensure_database_exists(settings.DATABASE_URL)
 engine = create_engine(settings.DATABASE_URL, **_engine_options(settings.DATABASE_URL))
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+    bind=engine,
+)
 
 
 def init_db():
@@ -140,5 +170,19 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        try:
+            db.rollback()
+        except OperationalError as exc:
+            if not _is_mysql_command_out_of_sync(exc):
+                logger.exception("Database rollback failed during request cleanup.")
+            db.invalidate()
+        raise
     finally:
-        db.close()
+        try:
+            db.close()
+        except OperationalError as exc:
+            if not _is_mysql_command_out_of_sync(exc):
+                raise
+            logger.warning("Invalidating MySQL session after command-out-of-sync during close.")
+            db.invalidate()
