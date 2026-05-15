@@ -3,10 +3,10 @@ services:
     image: mysql:8.4
     container_name: healthcare-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: root_password
-      MYSQL_DATABASE: healthcare_db
-      MYSQL_USER: healthcare_user
-      MYSQL_PASSWORD: healthcare_password
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-healthcare_db}
+      MYSQL_USER: ${MYSQL_USER:-healthcare_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-healthcare_password}
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
@@ -15,7 +15,7 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uhealthcare_user -phealthcare_password --silent"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -32,7 +32,7 @@ services:
     env_file:
       - ${ENV_FILE:-.env.docker.example}
     environment:
-      DATABASE_URL: mysql+pymysql://healthcare_user:healthcare_password@mysql:3306/healthcare_db?charset=utf8mb4
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-healthcare_user}:${MYSQL_PASSWORD:-healthcare_password}@mysql:3306/${MYSQL_DATABASE:-healthcare_db}?charset=utf8mb4
       HOST: 0.0.0.0
       PORT: 8000
       WAIT_FOR_HOST: mysql

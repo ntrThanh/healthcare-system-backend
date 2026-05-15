@@ -29,6 +29,7 @@ COPY requirements.txt .
 
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/python -m pip install --upgrade pip setuptools wheel \
+    && /opt/venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132 \
     && /opt/venv/bin/pip install -r requirements.txt
 
 ENV PATH="/opt/venv/bin:$PATH"
